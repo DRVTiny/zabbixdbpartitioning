@@ -11,55 +11,37 @@
 # SQL for the desired tables, and can create new partitions as the time goes on
 # assuming that the cronjob has been properly entered.
 #
+# 'GLOBAL' VARIABLES ->
+SQL='/tmp/partition.sql'
+PATHTOCRON='/usr/local/zabbix/cron.d'
+PATHTOMAILBIN='/usr/bin/mail'
+DUMP_FILE='/tmp/zabbix.sql'
+DBHOST='localhost'
+DBNAME='zabbix'
+DBUSER='zabbix'
+DBPASS='zabbix'
+SIMULATE=0
+NONINTERACTIVE=0
+BACKUP=0
+# Who to email with cron output by default
+EMAIL='root@localhost'
+# <- 'GLOBAL' VARIABLES
+doShowUsage () {
+ cat <<_EOF_
 
-#
-# Who to email with cron output
-#
-EMAIL="root@localhost"
+$0	[-H host][-u user][-p password][-d min_days][-y startyear][-n][-s][-e email_address][-b][-h]
 
-#
-# How long to keep the daily history
-#
-daily_history_min=90
-
-#
-# How long to keep the monthly history (months)
-#
-monthly_history_min=12
-
-#
-# Years to create the monthly partitions for
-#
-first_year=`date +"%Y"`
-last_year=$first_year
-cur_month=`date +"%m"`
-if [ $cur_month -eq 12 ]; then
-	last_year=$((first_year+1))
-	cur_month=1
-fi
-
-y=`date +"%Y"`
-
-SQL="/tmp/partition.sql"
-PATHTOCRON="/usr/local/zabbix/cron.d"
-PATHTOMAILBIN="/usr/bin/mail"
-DUMP_FILE=/tmp/zabbix.sql
-
-function usage {
-cat <<_EOF_
-
-$0	[-h host][-u user][-p password][-d min_days][-y startyear][-n][-s][-e email_address][-b]
-
-	-h host			database host
+	-H host			database host
 	-u user			db user
 	-p password		user password
-	-d min_days		Minimum number of days of history to keep (default: $daily_history_min)
-	-m min_months		Minimum number of months to keep trends (default: $monthly_history_min)
+	-d min_days		Minimum number of days of history to keep (default: ${history_min[daily]})
+	-m min_months		Minimum number of months to keep trends (default: ${history_min[monthly]})
 	-y startyear		First year to set up with partitions
 	-n noninteractive	Run without questions - careful, make sure you know what is going to happen. Needs my.cnf with correct permissions.
 	-b backup		Create backup of DB in $DUMP_FILE before alterations (only works with non-interactive mode, -n)
 	-s simulate		Create SQL file that would be executed for examination ($SQL)
 	-e email		Email address to receive partition update report (default: $EMAIL)
+	-h 		        For this help message
 
 
 After running this script, don't forget to disable housekeeping if
@@ -78,64 +60,87 @@ you didn't have the script disable it, and add the following cronjob
 Cron job
 
 0 0 * * *  $PATHTOCRON/housekeeping.sh
-
-
 _EOF_
-	exit
+	return 0
 }
 
-DBHOST=localhost
-DBUSER=zabbix
-DBPASS=zabbix
-SIMULATE=0
-NONINTERACTIVE=0
-BACKUP=0
-while getopts "m:nsbe:h:u:p:d:y:?h" flag; do
+(( BASH_VERSINFO[0]<4 )) && {
+ echo 'This script requires BASH 4 or newer' >&2
+ exit 1
+}
+
+[[ $1 == '-x' ]] && {
+ TRACE=1; shift; set -x
+}
+
+doCleaning () {
+ local i
+ for ((i=0; i<${#files2clean[@]}; i++)); do
+  rm -f "${files2clean[$i]}"
+ done
+ return 0
+}
+
+declare -a files2clean=()
+trap doCleaning EXIT
+
+# How long to keep the daily history (days) and monthly history (months)
+#
+declare -A history_min=([daily]=90 [monthly]=12)
+
+curDate=($(date +'%Y %m %d %H %M %S'))
+declare -i first_year=${curDate[0]}
+declare -i last_year=$first_year
+cur_month=${curDate[1]}
+if (( cur_month == 12 )); then
+	last_year+=1
+	cur_month=1
+fi
+y=$first_year
+
+die () {
+ echo "$1" >&2
+ exit ${2:-1}
+}
+
+msg () {
+ [[ $NONINTERACTIVE ]] || echo "$1" >&2
+}
+unset NONINTERACTIVE
+declare -A hshDM=([d]='daily' [m]='monthly')
+
+while getopts ': xhnsb H: m: e: u: p: d: y:' flag; do
 	case $flag in
-		h)	DBHOST=$OPTARG    ;;
+		H)	DBHOST=$OPTARG
+		        host $DBHOST &>/dev/null || die "Host $DBHOST not accessible or 'host' utility not installed"
+		;;
+		x)      set -x; TRACE=1   ;;
 		u)	DBUSER=$OPTARG    ;;
 		p)	DBPASS=$OPTARG    ;;
 		e)	EMAIL=$OPTARG     ;;
 		s)	SIMULATE=1        ;;
 		n)	NONINTERACTIVE=1  ;;
 		b)	BACKUP=1          ;;
-		d)	h=$OPTARG
-			if [ $h -gt 0 ] 2>/dev/null; then
-				daily_history_min=$h
-			else
-				echo "Invalid daily history min, exiting"
-				exit 1
-			fi
-			;;
-		m)	h=$OPTARG
-			if [ $h -gt 0 ] 2>/dev/null; then
-				monthly_history_min=$h
-			else
-				echo "Invalid monthly history min, exiting"
-				exit 1
-			fi
-			;;
-
+		[dm])	h=$OPTARG
+		        (( h )) || die "Invalid ${hshDM[$flag]} history min, exiting"
+			history_min[${hshDM[$flag]}]=$h
+		;;
 		y)	yy=$OPTARG
-			if [ $yy -lt $y -a $yy -gt 2000 ] 2>/dev/null; then
-				first_year=$yy
-			else
-				echo "Invalid year, exiting"
-				exit 1
-			fi
-			;;
-		?|h)	usage ;;
+		        (( yy<y & yy>2000 )) || die 'Invalid year passed to me, exiting'
+			first_year=$yy
+		;;
+		[\?h])	doShowUsage
+		        [[ $flag == 'h' ]]
+		        exit $? 
+		;;
+		*) doShowUsage; exit 1 ;;
 	esac
 done
 shift $((OPTIND-1))
 
-if [ $NONINTERACTIVE != 1 ]; then
-	echo "Ready to partition tables."
-fi
-
-if [ $SIMULATE = 0 ]; then
-	if [ $NONINTERACTIVE = 1 ]; then
-		mysql -B -h $DBHOST -e "GRANT CREATE ROUTINE ON zabbix.* TO '$DBUSER'@'localhost';"
+if [[ $SIMULATE -eq 0 ]]; then
+	if [[ $NONINTERACTIVE ]]; then
+		mysql -B -h $DBHOST -e "GRANT CREATE ROUTINE ON $DBNAME.* TO '$DBUSER'@'localhost';"
 #		echo "GRANT LOCK TABLES ON zabbix.* TO '${DBUSER}'@'${DBHOST}' IDENTIFIED BY '${DBPASS}';" | mysql -h${DBHOST} -u${DBADMINUSER} --password=${DBADMINPASS}
                 mysql -h $DBHOST -e "GRANT LOCK TABLES ON zabbix.* TO '$DBUSER'@'$DBHOST' IDENTIFIED BY '$DBPASS';"
 		if [ $BACKUP = 1 ]; then
@@ -184,14 +189,14 @@ if [ $SIMULATE = 0 ]; then
 	fi
 fi
 
-if [ $NONINTERACTIVE = 1 ]; then
+if [[ $NONINTERACTIVE ]]; then
 	yn='y'
 else
 	echo -e "\n\nReady to proceed:"
 
 	echo -e "\nStarting yearly partioning at: $first_year"
 	echo "and ending at: $last_year"
-	echo "With $daily_history_min days of daily history"
+	echo "With ${history_min[daily]} days of daily history"
 	echo -e "\n\nReady to proceed (Y/n): "
 	read yn
 	[ "$yn" = 'n' -o "$yn" = "N" ] && exit
@@ -207,14 +212,14 @@ MONTHLY_IDS=""
 TABLES="$DAILY $MONTHLY"
 IDS="$DAILY_IDS $MONTHLY_IDS"
 
-if [ $NONINTERACTIVE != 1 ]; then
+if ! [[ $NONINTERACTIVE ]]; then
 	echo "Use zabbix;  SELECT 'Altering tables';" >$SQL
 else
 	echo "Use zabbix;" >$SQL
 fi
 cnt=0
 for i in $TABLES; do
-	if [ $NONINTERACTIVE != 1 ]; then
+	if ! [[ $NONINTERACTIVE ]]; then
 		echo "Altering table: $i"
 		echo "SELECT '$i';" >>$SQL
 	fi
@@ -239,14 +244,14 @@ done
 
 echo -en "\n" >>$SQL
 for i in $MONTHLY; do
-	if [ $NONINTERACTIVE != 1 ]; then
+	if ! [[ $NONINTERACTIVE ]]; then
 		echo "Creating monthly partitions for table: $i"
 		echo "SELECT '$i';" >>$SQL
 	fi
 	echo "ALTER TABLE $i PARTITION BY RANGE( clock ) (" >>$SQL
 	for y in `seq $first_year $last_year`; do
 		last_month=12
-		[ $y -eq $last_year ] && last_month=$((cur_month+1))
+		(( y == last_year )) && last_month=$((cur_month+1))
 		for m in `seq 1 $last_month`; do
 			[ $m -lt 10 ] && m="0$m"
 			ms=`date +"%Y-%m-01" -d "$m/01/$y +1 month"`
@@ -260,12 +265,12 @@ for i in $MONTHLY; do
 done
 
 for i in $DAILY; do
-	if [ $NONINTERACTIVE != 1 ]; then
+	if ! [[ $NONINTERACTIVE ]]; then
 		echo "Creating daily partitions for table: $i"
 		echo "SELECT '$i';" >>$SQL
 	fi
 	echo "ALTER TABLE $i PARTITION BY RANGE( clock ) (" >>$SQL
-	for d in `seq -$daily_history_min 2`; do
+	for d in `seq -${history_min[daily]} 2`; do
 		ds=`date +"%Y-%m-%d" -d "$d day +1 day"`
 		pname=`date +"%Y%m%d" -d "$d day"`
 		echo -n "PARTITION p$pname  VALUES LESS THAN (UNIX_TIMESTAMP(\"$ds 00:00:00\"))" >>$SQL
@@ -278,7 +283,7 @@ done
 
 
 ###############################################################
-if [ $NONINTERACTIVE != 1 ]; then
+if ! [[ $NONINTERACTIVE ]]; then
 	cat >>$SQL <<_EOF_
 SELECT "Installing procedures";
 _EOF_
@@ -341,7 +346,7 @@ BEGIN
 	DECLARE OLDCLOCK timestamp;
 	DECLARE PARTITIONNAME varchar(16);
 	DECLARE CLOCK int;
-	SET @mindays = $daily_history_min;
+	SET @mindays = ${history_min[daily]};
 	SET @maxdays = @mindays+4;
 	SET @i = @maxdays;
 	droploop: LOOP
@@ -381,7 +386,7 @@ BEGIN
 	DECLARE OLDCLOCK timestamp;
 	DECLARE PARTITIONNAME varchar(16);
 	DECLARE CLOCK int;
-	SET @minmonths = $monthly_history_min;
+	SET @minmonths = ${history_min[monthly]};
 	SET @maxmonths = @minmonths+24;
 	SET @i = @maxmonths;
 	droploop: LOOP
@@ -437,7 +442,7 @@ if [ $SIMULATE = 1 ]; then
 	exit 0
 fi
 
-if [ $NONINTERACTIVE = 1 ]; then
+if [[ $NONINTERACTIVE ]]; then
 	yn='y'
 else
 	echo -e "\n\nReady to apply script to database, this may take a while.(Y/n): "
@@ -448,7 +453,7 @@ if [ "$yn" != "n" -a "$yn" != "N" ]; then
 fi
 
 conf=/etc/zabbix/zabbix_server.conf
-if [ $NONINTERACTIVE = 1 ]; then
+if [[ $NONINTERACTIVE ]]; then
 	yn='y'
 else
 	echo -e "\nDo you want to update the /etc/zabbix/zabbix_server.conf"
@@ -464,51 +469,53 @@ if [ "$yn" != "n" -a "$yn" != "N" ]; then
 	/etc/init.d/zabbix-server start 2>&1 > /dev/null
 fi
 
-tmpfile=/tmp/cron$$
-if [ $NONINTERACTIVE = 1 ]; then
+tmpfile=$(mktemp /tmp/XXXXXXXXXXXXX)
+files2clean+=("$tmpfile")
+
+if [[ $NONINTERACTIVE ]]; then
 	yn='y'
 else
-	echo -ne "\nDo you want to update the crontab (Y/n): "
+	echo -ne '\nDo you want to update the crontab (Y/n): '
 	read yn
 fi
-if [ "$yn" != "n" -a "$yn" != "N" ]; then
-	where=
-	while [ "$where" = "" ]; do
-		if [ $NONINTERACTIVE = 1 ]; then
+if [[ $yn =~ ^[Nn]$ ]]; then
+	where=''
+	until [[ $where ]]; do
+		if [[ $NONINTERACTIVE ]]; then
 			where='Y'
 		else
-			echo "The crontab entry can be either in /etc/cron.daily, or added"
-			echo -e "to the crontab for root\n"
-			echo -n "Do you want to add this to the /etc/cron.daily directory (Y/n): "
+		        
+			echo -e 'The crontab entry can be either in /etc/cron.daily, or added\nto the crontab for root\n'
+			echo -n 'Do you want to add this to the /etc/cron.daily directory (Y/n): '
 			read where
 		fi
-		[ "$where" = "" -o "$where" = "y" ] && where="Y"
-		if [ "$where" != "y" -a "$where" != "Y" -a "$where" != "n" -a "$where" != "N" ]; then
-			where=""
-			echo "Response not recognized, please try again"
+		where=${where:-Y}; where=${where^^}; where=${where:0:1}
+		if ! [[ $where =~ ^[YN]$ ]]; then
+			unset where
+			echo 'Response not recognized, please try again' >&2
 		fi
 	done
 
-	if [ $NONINTERACTIVE != 1 ]; then
-		echo -en "\nEnter email of who should get the daily housekeeping reports: "
+	if ! [[ $NONINTERACTIVE ]]; then
+		echo -en "\nEnter email of who should get the daily housekeeping reports [$EMAIL]: "
 		read mailto
 	fi
-	[ "$mailto" = "" ] && mailto=$EMAIL
+	mailto=${mailto:-$EMAIL}
 	mkdir -p $PATHTOCRON
 	cat >$PATHTOCRON/housekeeping.sh <<_EOF_
 #!/bin/bash
 
 MAILTO=$mailto
-tmpfile=/tmp/housekeeping\$\$
+tmpfile=\$(mktemp /tmp/XXXXXXXXXXXXXX)
 
 date >\$tmpfile
-/usr/bin/mysql --skip-column-names -B -h localhost -u zabbix -pzabbix zabbix -e "CALL create_zabbix_partitions();" >>\$tmpfile 2>&1
+/usr/bin/mysql --skip-column-names -B -h $DBHOST -u $DBUSER -p"$DBPASS" $DBNAME -e "CALL create_zabbix_partitions();" >>\$tmpfile 2>&1
 $PATHTOMAILBIN -s "Zabbix MySql Partition Housekeeping" \$MAILTO <\$tmpfile
 rm -f \$tmpfile
 _EOF_
 	chmod +x $PATHTOCRON/housekeeping.sh
 	chown -R zabbix.zabbix /usr/local/zabbix
-	if [ "$where" = "Y" ]; then
+	if [[ $where == 'Y' ]]; then
 		cat >/etc/cron.daily/zabbixhousekeeping <<_EOF_
 #!/bin/bash
 $PATHTOCRON/housekeeping.sh
@@ -523,5 +530,3 @@ _EOF_
 		rm $tmpfile
 	fi
 fi
-
-
